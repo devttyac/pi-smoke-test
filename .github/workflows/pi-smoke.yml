@@ -1,0 +1,131 @@
+name: PI Application Boundaries
+
+on:
+  workflow_call:
+    inputs:
+      runner-path:
+        required: true
+        type: string
+      dependency-file:
+        required: false
+        default: ''
+        type: string
+      coverage-policy:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  pi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PI_RUNNER_PATH: ${{ inputs.runner-path }}
+      PI_DEPENDENCY_FILE: ${{ inputs.dependency-file }}
+      PI_POLICY_JSON: ${{ inputs.coverage-policy }}
+      PYTHON_DOTENV_DISABLED: '1'
+      PI_SMOKE_ANTHROPIC_KEY: ''
+      PI_SMOKE_OPENAI_KEY: ''
+      ANTHROPIC_API_KEY: ''
+      OPENAI_API_KEY: ''
+      GEMINI_API_KEY: ''
+      GOOGLE_API_KEY: ''
+      GOOGLE_GENAI_API_KEY: ''
+      GOOGLE_APPLICATION_CREDENTIALS: ''
+      API_SECRET_KEY: ''
+      AZURE_OPENAI_API_KEY: ''
+      OPENROUTER_API_KEY: ''
+      COHERE_API_KEY: ''
+      MISTRAL_API_KEY: ''
+    steps:
+      - name: Checkout exact caller revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: caller
+          persist-credentials: false
+      - name: Checkout reviewed package
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: devttyac/pi-smoke-test
+          ref: baea6e6b1def2db4f1cd569bf7fed7262471c125
+          path: package
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - name: Validate inputs and run application boundaries
+        shell: python
+        run: |
+          # BEGIN PI_BOOTSTRAP
+          import hashlib
+          import importlib.util
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import tempfile
+
+          sys.dont_write_bytecode = True
+          PACKAGE_SHA = 'baea6e6b1def2db4f1cd569bf7fed7262471c125'
+          TOOL_SHA256 = '29d44dfc107c496a6c8b792314d03ea8b201d844bbba50f6a42ee66df7f8b3f5'
+
+          def main():
+              workspace = Path(os.environ['GITHUB_WORKSPACE']).resolve(strict=True)
+              caller = (workspace / 'caller').resolve(strict=True)
+              package = (workspace / 'package').resolve(strict=True)
+              package_revision = subprocess.run(
+                  ['git', '-C', str(package), 'rev-parse', 'HEAD'],
+                  check=True, capture_output=True, text=True).stdout.strip()
+              if package_revision != PACKAGE_SHA:
+                  raise ValueError('Package revision differs from reviewed pin')
+              spec = importlib.util.spec_from_file_location(
+                  'pinned_ci_checker', package / 'scripts/check_ci_result.py')
+              checker = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(checker)
+              harness = checker.validate_local_path(
+                  package, 'vendor/canonical/pi-smoke/scripts/prompt_injection_smoke_test.py')
+              if hashlib.sha256(harness.read_bytes()).hexdigest() != TOOL_SHA256:
+                  raise ValueError('Tool checksum differs from reviewed pin')
+              runner = checker.validate_local_path(caller, os.environ['PI_RUNNER_PATH'])
+              dependency_value = os.environ.get('PI_DEPENDENCY_FILE', '')
+              dependency = checker.validate_local_path(caller, dependency_value) if dependency_value else None
+              policy = json.loads(os.environ['PI_POLICY_JSON'],
+                  object_pairs_hook=checker._unique_object,
+                  parse_constant=checker._reject_constant)
+              runtime_fields = {'expected_revision', 'expected_harness_sha256'}
+              if type(policy) is not dict or policy.keys() != checker.POLICY_FIELDS - runtime_fields:
+                  raise ValueError('Supply coverage fields only; runtime identities are workflow-owned')
+              revision = subprocess.run(
+                  ['git', '-C', str(caller), 'rev-parse', 'HEAD'],
+                  check=True, capture_output=True, text=True).stdout.strip()
+              policy.update(expected_revision=revision, expected_harness_sha256=TOOL_SHA256)
+              checker._validate_policy(policy)
+              os.chdir(caller)
+              if dependency is not None:
+                  installed = subprocess.run(
+                      [sys.executable, '-I', '-m', 'pip', 'install', '--disable-pip-version-check', '-r', str(dependency)],
+                      check=False, capture_output=True, timeout=300)
+                  if installed.returncode != 0:
+                      return 2
+              with tempfile.TemporaryDirectory(prefix='pi-smoke-') as temporary:
+                  scratch = Path(temporary)
+                  policy_path = scratch / 'policy.json'
+                  policy_path.write_text(json.dumps(policy), encoding='utf-8')
+                  return checker.run_checked(runner, harness, scratch / 'report.json', policy_path)
+
+          try:
+              result = main()
+          except (OSError, ValueError, TypeError, KeyError, RecursionError, subprocess.SubprocessError):
+              print('PI bootstrap failed before complete application evidence.', file=sys.stderr)
+              result = 2
+          sys.exit(result)
+          # END PI_BOOTSTRAP

@@ -1,0 +1,149 @@
+name: PI Package Self-tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  self-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHON_DOTENV_DISABLED: '1'
+      PI_SMOKE_ANTHROPIC_KEY: ''
+      PI_SMOKE_OPENAI_KEY: ''
+      ANTHROPIC_API_KEY: ''
+      OPENAI_API_KEY: ''
+      GEMINI_API_KEY: ''
+      GOOGLE_API_KEY: ''
+      GOOGLE_GENAI_API_KEY: ''
+      GOOGLE_APPLICATION_CREDENTIALS: ''
+      API_SECRET_KEY: ''
+      AZURE_OPENAI_API_KEY: ''
+      OPENROUTER_API_KEY: ''
+      COHERE_API_KEY: ''
+      MISTRAL_API_KEY: ''
+      PIP_NO_INDEX: '1'
+    steps:
+      - name: Checkout exact source revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: source
+          persist-credentials: false
+      - name: Checkout reviewed package
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: devttyac/pi-smoke-test
+          ref: baea6e6b1def2db4f1cd569bf7fed7262471c125
+          path: package
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - name: Package contracts and offline mocks
+        run: python3 -I source/tests/test_ci_result.py
+      - name: Exercise actual reusable bootstrap with synthetic callers
+        shell: python
+        run: |
+          # BEGIN PI_WORKFLOW_SELF_TEST
+          import importlib.util
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import tempfile
+          import textwrap
+
+          sys.dont_write_bytecode = True
+          workspace = Path(os.environ['GITHUB_WORKSPACE']).resolve(strict=True)
+          package = (workspace / 'package').resolve(strict=True)
+          workflow = (workspace / 'source/.github/workflows/pi-smoke.yml').read_text(encoding='utf-8')
+          lines = workflow.splitlines()
+          begin = lines.index('          # BEGIN PI_BOOTSTRAP') + 1
+          end = lines.index('          # END PI_BOOTSTRAP')
+          bootstrap = textwrap.dedent('\n'.join(lines[begin:end])) + '\n'
+          compile(bootstrap, 'pi-smoke.yml bootstrap', 'exec')
+          spec = importlib.util.spec_from_file_location('package_fixtures', package / 'tests/test_ci_result.py')
+          fixtures = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(fixtures)
+
+          with tempfile.TemporaryDirectory(prefix='pi-workflow-self-test-') as temporary:
+              root = Path(temporary)
+              (root / 'package').symlink_to(package, target_is_directory=True)
+              caller = root / 'caller'
+              caller.mkdir()
+              bootstrap_path = root / 'bootstrap.py'
+              bootstrap_path.write_text(bootstrap, encoding='utf-8')
+              runner = caller / 'runner.py'
+              runner.write_text(textwrap.dedent('''\
+                  import argparse
+                  import os
+                  from pathlib import Path
+                  import subprocess
+                  import sys
+                  p = argparse.ArgumentParser()
+                  p.add_argument('--harness-path', required=True)
+                  p.add_argument('--report', required=True)
+                  args = p.parse_args()
+                  assert not Path(args.report).exists()
+                  assert not Path(args.report).is_symlink()
+                  assert os.environ['PYTHON_DOTENV_DISABLED'] == '1'
+                  for key in ('PI_SMOKE_ANTHROPIC_KEY', 'PI_SMOKE_OPENAI_KEY', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GEMINI_API_KEY', 'API_SECRET_KEY'):
+                      assert not os.environ.get(key)
+                  if os.environ.get('PI_OMIT_REPORT') != '1':
+                      emitter = Path(args.harness_path).resolve().parents[4] / 'tests/test_ci_result.py'
+                      emitted = subprocess.run([sys.executable, '-I', str(emitter), '--emit-canary', os.environ['PI_CANARY_KIND'], '--policy', 'fixture-policy.json', '--report', args.report], check=False)
+                      assert emitted.returncode == 0
+                  sys.exit(int(os.environ.get('PI_RUNNER_EXIT', '0')))
+                  '''), encoding='utf-8')
+              (caller / 'empty-requirements.txt').write_text('', encoding='utf-8')
+              (caller / 'broken-requirements.txt').write_text('-r absent-nested-requirements.txt\n', encoding='utf-8')
+              for args in (['init', '--quiet'], ['add', '.'], ['-c', 'user.name=PI fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--quiet', '-m', 'Synthetic caller fixture']):
+                  subprocess.run(['git', '-C', str(caller), *args], check=True, capture_output=True)
+              revision = subprocess.run(['git', '-C', str(caller), 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True).stdout.strip()
+              policy = fixtures.policy_fixture()
+              policy.update(expected_revision=revision, expected_harness_sha256=fixtures.CANONICAL_SHA256)
+              (caller / 'fixture-policy.json').write_text(json.dumps(policy), encoding='utf-8')
+              coverage = {key: value for key, value in policy.items() if key not in {'expected_revision', 'expected_harness_sha256'}}
+              environment = {**os.environ, 'GITHUB_WORKSPACE': str(root), 'PI_RUNNER_PATH': 'runner.py', 'PI_DEPENDENCY_FILE': '', 'PI_POLICY_JSON': json.dumps(coverage), 'PI_CANARY_KIND': 'valid', 'PI_RUNNER_EXIT': '0', 'PI_OMIT_REPORT': '0'}
+
+              def expect(label, expected, **overrides):
+                  child = subprocess.run([sys.executable, '-I', str(bootstrap_path)], env={**environment, **overrides}, check=False, capture_output=True, timeout=60)
+                  if child.returncode != expected:
+                      raise AssertionError(f'{label}: expected {expected}, got {child.returncode}')
+                  print(f'{label}: exit {expected}')
+
+              for kind, expected in [('valid', 0), ('attack', 1), ('error', 2), ('unclear', 3), ('abandon', 2), ('missing', 2)]:
+                  expect(kind, expected, PI_CANARY_KIND=kind)
+              for code in (1, 2, 3, 7):
+                  expect(f'runner exit {code} with valid evidence', code if code in (1, 2, 3) else 2, PI_RUNNER_EXIT=str(code))
+              expect('runner attack plus report error', 2, PI_RUNNER_EXIT='1', PI_CANARY_KIND='error')
+              expect('runner unclear plus report attack', 1, PI_RUNNER_EXIT='3', PI_CANARY_KIND='attack')
+              expect('omitted fresh report', 2, PI_OMIT_REPORT='1')
+              expect('missing runner', 2, PI_RUNNER_PATH='absent.py')
+              for value in ('runner.py;echo', '../runner.py', str(runner)):
+                  expect('unsafe runner path', 2, PI_RUNNER_PATH=value)
+              (caller / 'escape.py').symlink_to(package / 'scripts/check_ci_result.py')
+              expect('escaping runner symlink', 2, PI_RUNNER_PATH='escape.py')
+              expect('empty dependency file', 0, PI_DEPENDENCY_FILE='empty-requirements.txt')
+              expect('missing dependency file', 2, PI_DEPENDENCY_FILE='absent-requirements.txt')
+              expect('dependency installation error', 2, PI_DEPENDENCY_FILE='broken-requirements.txt')
+              expect('unsafe dependency path', 2, PI_DEPENDENCY_FILE='empty-requirements.txt;echo')
+              expect('caller-supplied runtime identities', 2, PI_POLICY_JSON=json.dumps(policy))
+              expect('duplicate policy field', 2, PI_POLICY_JSON='{"version": 1,' + json.dumps(coverage)[1:])
+              expect('malformed policy', 2, PI_POLICY_JSON='{')
+              expect('nonstandard JSON constant', 2, PI_POLICY_JSON='NaN')
+              reduced = {**coverage, 'attack_ids': ['ADV-01']}
+              expect('reduced policy inventory', 2, PI_POLICY_JSON=json.dumps(reduced))
+          # END PI_WORKFLOW_SELF_TEST

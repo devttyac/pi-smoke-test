@@ -93,3 +93,37 @@ Kinds are `valid`, `attack`, `error`, `unclear`, `abandon` and `missing`, expect
 ## Licence
 
 MIT; see `LICENSE` and `NOTICE.md`. The licence text follows the [Open Source Initiative MIT text](https://opensource.org/license/mit).
+
+## Reusable workflow
+
+`.github/workflows/pi-smoke.yml` exposes exactly three string inputs:
+
+| Input | Meaning |
+| --- | --- |
+| `runner-path` | Required existing repository-local Python runner file |
+| `dependency-file` | Optional existing repository-local pip requirements file; defaults to an empty string for standard-library callers |
+| `coverage-policy` | Required independent JSON policy containing the six coverage fields below |
+
+Supply `version`, `attack_ids`, `surfaces`, `tool_na`, `benign_ids` and `control_ids` as described above. Runtime identities `expected_revision` and `expected_harness_sha256` are supplied by the workflow, so the complete policy has eight fields. Caller-supplied runtime identity fields are rejected, including claims that match the actual identity. Duplicate JSON keys, nonstandard constants and invalid policy fields are rejected through the pinned checker's own parser hooks and validator.
+
+The workflow checks out the exact caller PR head (or `github.sha` outside a PR) under `caller`, and the reviewed package commit `baea6e6b1def2db4f1cd569bf7fed7262471c125` under `package`. It verifies package HEAD, validates the trusted harness path and tool checksum, and reads the caller's actual Git HEAD for policy identity. The checker and harness remain separate from caller source. The bootstrap imports the pinned checker and invokes `run_checked` with validated absolute paths; unlike the CLI launch mode, this lets the trusted harness reside in the separate package checkout.
+
+Runner and optional dependency paths use `validate_local_path` under the caller root. All inputs travel through environment variables; none enter shell source. Dependency installation uses an argument-list subprocess. Invalid inputs or installation errors return 2. The bootstrap creates its own temporary directory and nonexistent report destination, validates the independent policy, and preserves checker/runner precedence even after runner failure. Job timeout is 15 minutes; dependency installation has a 300-second timeout.
+
+Python 3.11 and Node 24 are supplied by pinned setup Actions. Both checkouts disable persisted credentials. Workflow permissions are `contents: read`; no secrets are declared or inherited. Dotenv loading is disabled and model credential environment values are cleared. Application runners must mock effects and reject unexpected model/network calls; an empty credential alone does not establish that a runner is offline. No key files or live providers are used by the package self-tests. No reports are uploaded as artifacts.
+
+Consumers must reference this reusable workflow at its separately reviewed full **workflow commit SHA**, which is captured after workflow review and commit. That SHA differs from the frozen package commit above. Publication and hosted verification remain separate delivery steps. After any executable package change, review and commit a new package, update both workflow package pins, review and commit the workflows again, and then update callers to the new workflow commit.
+
+Action commits verified from the official GitHub repository tag refs on 2026-10-07:
+
+| Action | Verified full commit | Official source |
+| --- | --- | --- |
+| checkout v4 | `11d5960a326750d5838078e36cf38b85af677262` | [checkout tag ref](https://api.github.com/repos/actions/checkout/git/ref/tags/v4) |
+| setup-python v5 | `a26af69be951a213d495a4c3e4e4022e16d87065` | [setup-python tag ref](https://api.github.com/repos/actions/setup-python/git/ref/tags/v5) |
+| setup-node v4 | `49933ea5288caeca8642d1e84afbd3f7d6820020` | [setup-node tag ref](https://api.github.com/repos/actions/setup-node/git/ref/tags/v4) |
+
+## Hosted package self-tests
+
+`.github/workflows/self-test.yml` runs on normal pull requests and pushes to `main`. It checks the exact source head, runs the packaged standard-library tests and both offline mocks, then extracts the actual inline Python bootstrap from `pi-smoke.yml` and executes it against temporary synthetic Git callers using the frozen package.
+
+Each synthetic result is asserted against its expected exit code: valid 0, attack 1, error 2, unclear 3, abandonment 2 and missing coverage 2. Additional cases cover nonzero runner exits, mixed result precedence, an omitted fresh report, missing/unsafe/escaping runner paths, empty/missing/unsafe dependency files, dependency installation failure and invalid/duplicate/identity-claiming policy JSON. `PIP_NO_INDEX=1` prevents self-test dependency fixtures from fetching packages. These fixtures exercise workflow/checker contracts only and do not count as application-resistance evidence. Expected nonzero codes are explicitly checked by the self-test; no `continue-on-error` bypass is used.
