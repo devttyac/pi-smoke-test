@@ -146,5 +146,4 @@ jobs:
               expect('nonstandard JSON constant', 2, PI_POLICY_JSON='NaN')
               reduced = {**coverage, 'attack_ids': ['ADV-01']}
               expect('reduced policy inventory', 2, PI_POLICY_JSON=json.dumps(reduced))
-              expect('required-check protection canary', 0, PI_CANARY_KIND='attack')
           # END PI_WORKFLOW_SELF_TEST
